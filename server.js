@@ -23,6 +23,7 @@ const redisConnection = process.env.REDIS_URL;
 const redis = redisConnection ? new Redis(redisConnection) : null;
 
 app.use(express.static(path.join(__dirname, "public")));
+app.use("/images", express.static(path.join(__dirname, "images")));
 
 let rooms = {};
 let saveScheduled = false;
@@ -133,9 +134,12 @@ function calculateWeightedRating(role, bat, bowl, field) {
 
 // ==========================================================================
 //  WINNER-SCORING ENGINE
-//  MeritScore(player) = 0.25*StatsScore + 0.40*ValueScore + 0.20*OtherScore
-//  Every player in the XI also gets a flat TeamVersatilityBonus (0-15) added
-//  on top, since versatility is a whole-XI property, not a per-player one.
+//  Every player in the XI gets an effective score (0-100):
+//      40% StatsScore   (4-5yr batting/bowling stats)
+//    + 40% TeamScore    (team balance + versatility, same value for the whole XI)
+//    + 20% RatingScore  (skill rating from bat/bowl/field)
+//  Captain x2, Vice-Captain x1.5 and the leadership bonus are applied on top,
+//  exactly as before. Price paid (over/under-pricing) no longer matters.
 // ==========================================================================
 
 // --- 1. FIELD-NAME ADAPTER -------------------------------------------------
@@ -162,10 +166,19 @@ const STYLE_BUCKET_MAP = {
 
 // --- 2. TUNABLE KNOBS -------------------------------------------------------
 const WEIGHTS = {
-    stats: 0.25,
-    value: 0.40,
-    other: 0.20,
-    versatility: 0.15   // applied as a flat bonus, not inside MeritScore
+    stats: 0.40,
+    team:  0.40,   // team balance + versatility
+    rating: 0.20   // player skill rating
+};
+
+// How the 40% team bucket is split between its two parts (must sum to 1)
+const TEAM_SPLIT = { balance: 0.5, versatility: 0.5 };
+
+// Role-balance deductions (taken off the 0-100 BalanceScore)
+const BALANCE_RULES = {
+    maxWK: 2,            wkPenalty: 20,        // per extra keeper
+    minBowlingOptions: 5, bowlPenalty: 25,     // per missing bowler/all-rounder
+    minPureBatters: 3,    batPenalty: 15       // per missing pure batter
 };
 
 // Normalization bounds for turning raw stats into a 0-100 scale.
@@ -177,7 +190,6 @@ const STAT_BOUNDS = {
     bsrMin: 15, bsrMax: 35      // bowling strike rate, balls/wicket (lower is better)
 };
 
-const VALUE_SLOPE = 25;                    // how sharply overpaying drags ValueScore down
 const UNCAPPED_STATS_FALLBACK_FACTOR = 0.7; // players with no 4-5yr stats get SkillRating * this, as StatsScore
 
 // --- 3. GENERIC HELPERS ------------------------------------------------------
@@ -234,27 +246,32 @@ function getStatsScore(player) {
     return clamp(raw, 0, 100);
 }
 
-// --- 5. BUCKET B: ValueScore (40%) — steal deal vs overpaid -----------------
-function getValueScore(player) {
-    const base = parseFloat(player.basePrice);
-    const sold = parseFloat(player.soldPrice);
-    if (!base || base <= 0 || isNaN(sold)) return 50; // neutral if price data is missing
-    const factor = sold / base;
-    return clamp(100 - (factor - 1) * VALUE_SLOPE, 0, 100);
-}
-
-// --- 6. BUCKET C: OtherScore (20%) — existing subjective skill rating -------
-function getOtherScore(player) {
+// --- 5. BUCKET B: RatingScore (20%) — skill rating from bat/bowl/field -----
+function getRatingScore(player) {
     return calculateWeightedRating(player.role, player.bat, player.bowl, player.field);
 }
 
-// --- 7. Per-player MeritScore (0-100) ---------------------------------------
-function getMeritScore(player) {
-    const stats = getStatsScore(player);
-    const value = getValueScore(player);
-    const other = getOtherScore(player);
-    const merit = (WEIGHTS.stats * stats) + (WEIGHTS.value * value) + (WEIGHTS.other * other);
-    return clamp(merit, 0, 100);
+// --- 6. Per-player score from the player-level buckets (max 60 of the 100) ---
+function getPlayerComponent(player) {
+    return (WEIGHTS.stats * getStatsScore(player)) + (WEIGHTS.rating * getRatingScore(player));
+}
+
+// --- 7. Team Balance (0-100) — role composition of the XI --------------------
+function computeTeamBalanceScore(selectedPlayers) {
+    let wk = 0, bat = 0, bowl = 0, ar = 0;
+    selectedPlayers.forEach(p => {
+        const r = (p.role || "").toLowerCase();
+        if (r.includes("wicket") || r === "wk") wk++;
+        else if (r === "batsman" || r === "bat") bat++;
+        else if (r === "bowler" || r === "bowl") bowl++;
+        else if (r.includes("all") || r === "ar") ar++;
+    });
+    let deduction = 0;
+    if (wk > BALANCE_RULES.maxWK) deduction += (wk - BALANCE_RULES.maxWK) * BALANCE_RULES.wkPenalty;
+    const bowlingOptions = bowl + ar;
+    if (bowlingOptions < BALANCE_RULES.minBowlingOptions) deduction += (BALANCE_RULES.minBowlingOptions - bowlingOptions) * BALANCE_RULES.bowlPenalty;
+    if (bat < BALANCE_RULES.minPureBatters) deduction += (BALANCE_RULES.minPureBatters - bat) * BALANCE_RULES.batPenalty;
+    return clamp(100 - deduction, 0, 100);
 }
 
 // --- 8. Team Versatility (15%) — computed once per submitted XI -------------
@@ -282,6 +299,12 @@ function computeTeamVersatilityScore(selectedPlayers) {
     const battingVarietyScore = clamp((leftHandedBatters / 3) * 100, 0, 100);
 
     return (0.7 * bowlingVarietyScore) + (0.3 * battingVarietyScore);
+}
+
+// Combined TeamScore (0-100) = balance + versatility, split via TEAM_SPLIT
+function computeTeamScore(selectedPlayers) {
+    return (TEAM_SPLIT.balance * computeTeamBalanceScore(selectedPlayers))
+         + (TEAM_SPLIT.versatility * computeTeamVersatilityScore(selectedPlayers));
 }
 
 function loadPlayerDatabase() {
@@ -1077,12 +1100,10 @@ io.on("connection", (socket) => {
       const viceCaptain = selectedPlayers.find(p => p.id === vcId);
       if(!captain || !viceCaptain || cId === vcId) return fail("Pick a different Captain and Vice-Captain from your XI.");
 
-      // Whole-XI versatility (bowling variety + LH/RH batting mix), applied
-      // as an identical flat bonus to every player in this XI.
-      const teamVersatilityScore = computeTeamVersatilityScore(selectedPlayers);
-      const versatilityBonus = WEIGHTS.versatility * teamVersatilityScore; // 0-15
+      // Team bucket (balance + versatility), identical for every player in this XI
+      const teamBonus = WEIGHTS.team * computeTeamScore(selectedPlayers); // 0-40
 
-      const getEffectiveScore = (p) => getMeritScore(p) + versatilityBonus;
+      const getEffectiveScore = (p) => getPlayerComponent(p) + teamBonus;
 
       const cEffRating = getEffectiveScore(captain);
       const vcEffRating = getEffectiveScore(viceCaptain);
@@ -1096,22 +1117,6 @@ io.on("connection", (socket) => {
           }
       });
 
-      let wkCount = 0, batCount = 0, bowlCount = 0, arCount = 0;
-      selectedPlayers.forEach(p => {
-          const r = p.role.toLowerCase();
-          if (r.includes("wicket") || r === "wk") wkCount++;
-          else if (r === "batsman" || r === "bat") batCount++;
-          else if (r === "bowler" || r === "bowl") bowlCount++;
-          else if (r.includes("all") || r === "ar") arCount++;
-      });
-
-      let balancePenalty = 0;
-      if (wkCount > 2) balancePenalty += (wkCount - 2) * 20;
-      const bowlingOptions = bowlCount + arCount;
-      if (bowlingOptions < 5) balancePenalty += (5 - bowlingOptions) * 25;
-      if (batCount < 3) balancePenalty += (3 - batCount) * 15;
-
-      score -= balancePenalty;
       if (score < 0) score = 0;
 
       team.totalScore = Math.round(score * 100) / 100;
