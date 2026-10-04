@@ -46,6 +46,9 @@ async function loadGameData() {
                     room.auction.skippedBy = new Set();
                 }
                 
+                if (room.auction && room.auction.activeIndex === undefined) {
+                    room.auction.activeIndex = (room.auction.biddingOpen || room.auction.isPaused) ? room.auction.currentPlayerIndex : -1;
+                }
                 if (room.auction && room.auction.phase === 'RESULT' && !room.auction.resultStage) {
                     room.auction.resultStage = 'PUBLIC';
                 }
@@ -85,7 +88,8 @@ function saveGameData() {
                         phase: room.auction.phase,
                         skippedBy: Array.from(room.auction.skippedBy || []),
                         timeLeft: room.auction.timeLeft,
-                        resultStage: room.auction.resultStage || null
+                        resultStage: room.auction.resultStage || null,
+                        activeIndex: room.auction.activeIndex
                     },
                     lastActivity: room.lastActivity
                 };
@@ -178,7 +182,7 @@ const TEAM_SPLIT = { balance: 0.5, versatility: 0.5 };
 const BALANCE_RULES = {
     maxWK: 2,            wkPenalty: 20,        // per extra keeper
     minBowlingOptions: 5, bowlPenalty: 25,     // per missing bowler/all-rounder
-    minPureBatters: 3,    batPenalty: 15       // per missing pure batter
+    minBatters: 4,        batPenalty: 15       // WK + Batsman combined must be MORE than 3 (i.e. >= 4); per missing one
 };
 
 // Normalization bounds for turning raw stats into a 0-100 scale.
@@ -266,11 +270,12 @@ function computeTeamBalanceScore(selectedPlayers) {
         else if (r === "bowler" || r === "bowl") bowl++;
         else if (r.includes("all") || r === "ar") ar++;
     });
+    const batters = bat + wk; // wicketkeepers count towards the batting requirement
     let deduction = 0;
     if (wk > BALANCE_RULES.maxWK) deduction += (wk - BALANCE_RULES.maxWK) * BALANCE_RULES.wkPenalty;
     const bowlingOptions = bowl + ar;
     if (bowlingOptions < BALANCE_RULES.minBowlingOptions) deduction += (BALANCE_RULES.minBowlingOptions - bowlingOptions) * BALANCE_RULES.bowlPenalty;
-    if (bat < BALANCE_RULES.minPureBatters) deduction += (BALANCE_RULES.minPureBatters - bat) * BALANCE_RULES.batPenalty;
+    if (batters < BALANCE_RULES.minBatters) deduction += (BALANCE_RULES.minBatters - batters) * BALANCE_RULES.batPenalty;
     return clamp(100 - deduction, 0, 100);
 }
 
@@ -340,13 +345,17 @@ function shuffleArray(array) {
 
 
 // ==========================================================================
-//  AUCTION ORDER (systematic sets instead of a fully random pool)
-//  Capped:   Batters -> Pace Bowlers -> Spin Bowlers -> Keepers -> All-Rounders
-//  Uncapped: same sequence again.
-//  Players are still shuffled *within* each set so order inside a set is random.
+//  AUCTION ORDER (fixed sequence, no random pool)
+//  1) Indian players first, then Overseas players
+//  2) inside each: Capped first, then Uncapped
+//  3) inside each: Batters -> Pace -> Spin -> Keepers -> All-Rounders
+//  Players inside a set keep the order they have in players.json.
+//  Set SHUFFLE_WITHIN_SET = true if you want them shuffled inside each set.
 // ==========================================================================
-const AUCTION_SEQUENCE = ["Batter", "Pace Bowler", "Spin Bowler", "Wicketkeeper", "All-Rounder"];
+const AUCTION_COUNTRY_ORDER = ["India", "Overseas"];
 const AUCTION_STATUS_ORDER = ["Capped", "Uncapped"];
+const AUCTION_SEQUENCE = ["Batter", "Pace Bowler", "Spin Bowler", "Wicketkeeper", "All-Rounder"];
+const SHUFFLE_WITHIN_SET = false;
 
 function isSpinStyle(style) {
     const s = (style || "").toLowerCase();
@@ -357,24 +366,48 @@ function getAuctionCategory(p) {
     const role = (p.role || "").toLowerCase();
     if (role.includes("wicket") || role === "wk") return "Wicketkeeper";
     if (role.includes("all")) return "All-Rounder";
-    if (role === "bowler") return isSpinStyle(p.bowlingStyle) ? "Spin Bowler" : "Pace Bowler";
+    if (role === "bowler") {
+        // style may be a code (OS, LS, SLA...) or a word (Off Spin...)
+        const code = String(p.bowlingStyle || "");
+        return (STYLE_BUCKET_MAP[code] || "").startsWith("spin") || isSpinStyle(code) ? "Spin Bowler" : "Pace Bowler";
+    }
     return "Batter"; // Batsman + anything unrecognised
 }
 
+function getCountryGroup(p) { return p.country === "Overseas" ? "Overseas" : "India"; }
+
 function buildAuctionOrder(players) {
     const ordered = [];
-    AUCTION_STATUS_ORDER.forEach(status => {
-        AUCTION_SEQUENCE.forEach(category => {
-            const set = players.filter(p =>
-                (p.status || "Uncapped") === status && getAuctionCategory(p) === category);
-            shuffleArray(set).forEach(p => ordered.push({ ...p, auctionSet: `${status} ${category}s` }));
+    AUCTION_COUNTRY_ORDER.forEach(country => {
+        AUCTION_STATUS_ORDER.forEach(status => {
+            AUCTION_SEQUENCE.forEach(category => {
+                let set = players.filter(p =>
+                    getCountryGroup(p) === country &&
+                    (p.status || "Uncapped") === status &&
+                    getAuctionCategory(p) === category);
+                if (SHUFFLE_WITHIN_SET) set = shuffleArray(set);
+                const label = `${country === "India" ? "Indian" : "Overseas"} ${status} ${category}s`;
+                set.forEach(p => ordered.push({ ...p, auctionSet: label }));
+            });
         });
     });
     // Safety net: anything with an unexpected status still gets auctioned, at the end
     const placed = new Set(ordered.map(p => p.id));
-    shuffleArray(players.filter(p => !placed.has(p.id)))
-        .forEach(p => ordered.push({ ...p, auctionSet: "Other" }));
+    players.filter(p => !placed.has(p.id)).forEach(p => ordered.push({ ...p, auctionSet: "Other" }));
     return ordered;
+}
+
+// Progress info sent to the UI: current player number and how many are still to come
+function getProgress(auction) {
+    const total = auction.playerPool.length;
+    const idx = Math.min(auction.currentPlayerIndex, total - 1);
+    const p = auction.playerPool[idx];
+    return {
+        number: Math.min(auction.currentPlayerIndex + 1, total),
+        total,
+        left: Math.max(total - (auction.currentPlayerIndex + 1), 0),
+        set: p ? (p.auctionSet || null) : null
+    };
 }
 
 // The host is an organiser only: they are NOT stored in room.teams.
@@ -618,9 +651,22 @@ function startAuctionTimer(roomId, startTime = 15) {
     }, 1000);
 }
 
+// A player can be resolved (sold/unsold) exactly once, and only while he is the
+// revealed, active player. This stops a late timer tick / skip / force-skip from
+// "selling" the NEXT player to the previous bidder at the same price.
+function claimPlayerResolution(auction) {
+    if (auction.phase !== "AUCTION") return false;
+    if (auction.activeIndex !== auction.currentPlayerIndex) return false;
+    if (!auction.playerPool[auction.currentPlayerIndex]) return false;
+    auction.activeIndex = -1;
+    if (auction.timer) { clearInterval(auction.timer); auction.timer = null; }
+    return true;
+}
+
 function finishBidding(roomId) {
     const room = rooms[roomId];
     if (!room) return;
+    if (!claimPlayerResolution(room.auction)) return;
 
     const auction = room.auction;
     auction.biddingOpen = false;
@@ -642,6 +688,7 @@ function finishBidding(roomId) {
         io.to(roomId).emit("player-unsold", { player });
     }
 
+    auction.currentBidderId = null; // never leave a stale winner behind for the next player
     checkAuctionCompletion(roomId);
     prepareNext(roomId);
 }
@@ -649,7 +696,9 @@ function finishBidding(roomId) {
 function finishPlayerUnsold(roomId) {
     const room = rooms[roomId];
     if (!room) return; 
+    if (!claimPlayerResolution(room.auction)) return;
     room.auction.biddingOpen = false;
+    room.auction.currentBidderId = null;
     const player = room.auction.playerPool[room.auction.currentPlayerIndex];
     io.to(roomId).emit("player-unsold", { player });
     prepareNext(roomId);
@@ -675,7 +724,7 @@ function prepareNext(roomId) {
             if (room.auction.currentPlayerIndex >= room.auction.playerPool.length) {
                 endAuctionPhase(roomId);
             } else {
-                io.to(roomId).emit("awaiting-next-player");
+                io.to(roomId).emit("awaiting-next-player", { progress: getProgress(room.auction) });
             }
         }
     }, 4000);
@@ -709,7 +758,7 @@ io.on("connection", (socket) => {
                   const player = room.auction.playerPool[room.auction.currentPlayerIndex];
                   
                   if (room.auction.biddingOpen || room.auction.isPaused) {
-                      socket.emit("player-revealed", { player, currentBid: room.auction.currentBid });
+                      socket.emit("player-revealed", { player, currentBid: room.auction.currentBid, progress: getProgress(room.auction) });
                       if (!room.auction.isPaused) {
                           socket.emit("bidding-opened", { currentBid: room.auction.currentBid, timeLeft: room.auction.timeLeft });
                           if(room.auction.currentBidderId) {
@@ -725,7 +774,7 @@ io.on("connection", (socket) => {
                           socket.emit("timer-paused", { timeLeft: room.auction.timeLeft });
                       }
                   } else {
-                      socket.emit("awaiting-next-player");
+                      socket.emit("awaiting-next-player", { progress: getProgress(room.auction) });
                   }
               } else if(room.auction.phase === "SELECTION") {
                   socket.emit("start-selection-phase");
@@ -757,7 +806,7 @@ io.on("connection", (socket) => {
       bannedUsers: [], 
       teams: {},   // host is organiser only; only joining players get teams
       auction: {
-        playerPool: initialPool, currentPlayerIndex: 0, currentBid: 0, currentBidderId: null, biddingOpen: false, isPaused: false, phase: "LOBBY", skippedBy: new Set(), timeLeft: 15, timer: null
+        playerPool: initialPool, currentPlayerIndex: 0, currentBid: 0, currentBidderId: null, biddingOpen: false, isPaused: false, phase: "LOBBY", skippedBy: new Set(), timeLeft: 15, timer: null, activeIndex: -1
       },
       lastActivity: Date.now(),
       nextPlayerTimeout: null
@@ -795,7 +844,7 @@ io.on("connection", (socket) => {
     if(room.auction.phase === "AUCTION") {
         const player = room.auction.playerPool[room.auction.currentPlayerIndex];
         if (room.auction.biddingOpen || room.auction.isPaused) {
-            socket.emit("player-revealed", { player, currentBid: room.auction.currentBid });
+            socket.emit("player-revealed", { player, currentBid: room.auction.currentBid, progress: getProgress(room.auction) });
             if (!room.auction.isPaused) {
                 socket.emit("bidding-opened", { currentBid: room.auction.currentBid, timeLeft: room.auction.timeLeft });
                 socket.emit("timer-update", room.auction.timeLeft);
@@ -803,7 +852,7 @@ io.on("connection", (socket) => {
                 socket.emit("timer-paused", { timeLeft: room.auction.timeLeft });
             }
         } else {
-            socket.emit("awaiting-next-player");
+            socket.emit("awaiting-next-player", { progress: getProgress(room.auction) });
         }
     } else if(room.auction.phase === "SELECTION") socket.emit("start-selection-phase");
     else if (room.auction.phase === "RESULT") sendResultsTo(socket, roomId, userId);
@@ -853,7 +902,7 @@ io.on("connection", (socket) => {
     updateRoomActivity(roomId);
     saveGameData();
     io.to(roomId).emit("auction-started-signal");
-    io.to(roomId).emit("awaiting-next-player");
+    io.to(roomId).emit("awaiting-next-player", { progress: getProgress(room.auction) });
   });
 
   socket.on("host-reveal-next", ({ roomId }) => {
@@ -862,7 +911,11 @@ io.on("connection", (socket) => {
     const room = rooms[roomId];
     if (!room || room.hostId !== userId) return;
 
+    if (room.auction.phase !== "AUCTION") return;
+    if (room.auction.biddingOpen || room.auction.isPaused) return; // already live, don't reset bids
     const player = room.auction.playerPool[room.auction.currentPlayerIndex];
+    if (!player) return endAuctionPhase(roomId);
+    room.auction.activeIndex = room.auction.currentPlayerIndex;
     room.auction.currentBid = player.basePrice;
     room.auction.currentBidderId = null;
     room.auction.skippedBy = new Set();
@@ -873,7 +926,7 @@ io.on("connection", (socket) => {
     updateRoomActivity(roomId);
     saveGameData();
 
-    io.to(roomId).emit("player-revealed", { player, currentBid: room.auction.currentBid });
+    io.to(roomId).emit("player-revealed", { player, currentBid: room.auction.currentBid, progress: getProgress(room.auction) });
   });
 
   socket.on("host-start-bidding", ({ roomId }) => {
@@ -883,6 +936,8 @@ io.on("connection", (socket) => {
     if (!room || room.hostId !== userId) return;
 
     const auction = room.auction;
+    if (auction.phase !== "AUCTION" || auction.biddingOpen) return;
+    if (auction.activeIndex !== auction.currentPlayerIndex) return; // player not revealed yet
     auction.biddingOpen = true;
     auction.isPaused = false;
     updateRoomActivity(roomId);

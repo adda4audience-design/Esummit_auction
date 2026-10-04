@@ -187,9 +187,11 @@
             <div id="cooldownView" class="hidden absolute inset-0 z-30 bg-slate-900/95 flex flex-col items-center justify-center text-center p-4">
                 <h2 class="text-5xl font-bold mb-2" id="soldStatusTitle">SOLD</h2>
                 <p class="text-xl text-gray-300" id="soldStatusText">---</p>
+                <div id="cooldownProgress" class="hidden mt-4 px-3 py-1 rounded-full bg-slate-800 border border-slate-600 text-xs font-bold text-gray-200"></div>
             </div>
 
             <div id="auctionView" class="hidden flex-col h-full p-2 lg:p-6 overflow-y-auto">
+                <div id="auctionProgress" class="hidden self-center mb-2 px-3 py-1 rounded-full bg-slate-800 border border-slate-600 text-[11px] font-bold text-gray-200 text-center"></div>
                 <!-- ===== REVEAL STAGE ===== -->
                 <div id="revealStage" class="hidden flex-col items-center justify-center w-full min-h-full py-8">
                     <div id="revealCardInner" class="flex flex-col items-center text-center max-w-md w-full">
@@ -661,8 +663,21 @@
         document.getElementById('gameStatus').textContent = "Live"; 
     });
 
-    socket.on('awaiting-next-player', () => {
+    function renderProgress(p, upcoming) {
+        const ids = ['auctionProgress', 'cooldownProgress'];
+        ids.forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (!p) { el.classList.add('hidden'); return; }
+            const setTxt = p.set ? ` • ${p.set}` : '';
+            el.textContent = `${upcoming ? 'Up next: ' : ''}Player ${p.number} / ${p.total} • ${p.left} left in pool${setTxt}`;
+            el.classList.remove('hidden');
+        });
+    }
+
+    socket.on('awaiting-next-player', (data) => {
         isBiddingActive = false;
+        renderProgress(data && data.progress, true);
         clearAllViews();
         const cd = document.getElementById('cooldownView');
         cd.classList.remove('hidden'); cd.style.display = 'flex';
@@ -784,9 +799,10 @@
         updateStatsUI('player', stats);
     }
 
-    socket.on('player-revealed', ({ player, currentBid }) => {
+    socket.on('player-revealed', ({ player, currentBid, progress }) => {
         isBiddingActive = false;
         clearAllViews();
+        renderProgress(progress, false);
         document.getElementById('auctionView').classList.remove('hidden');
         document.getElementById('auctionView').style.display = 'flex';
         
