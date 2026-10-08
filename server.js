@@ -52,10 +52,17 @@ async function loadGameData() {
                 if (room.auction && room.auction.phase === 'RESULT' && !room.auction.resultStage) {
                     room.auction.resultStage = 'PUBLIC';
                 }
-                if (room.auction.phase === 'AUCTION' && room.auction.biddingOpen && !room.auction.isPaused) {
-                    startAuctionTimer(roomId, room.auction.timeLeft || 15);
+                rooms[roomId] = room;   // must be registered BEFORE startAuctionTimer looks it up
+                if (room.auction.phase === 'AUCTION' && room.auction.biddingOpen && !room.auction.isPaused
+                    && room.auction.activeIndex === room.auction.currentPlayerIndex) {
+                    startAuctionTimer(roomId, Math.max(1, room.auction.timeLeft || 15));
+                } else if (room.auction.phase === 'AUCTION'
+                    && (room.auction.biddingOpen || room.auction.isPaused)
+                    && room.auction.activeIndex !== room.auction.currentPlayerIndex) {
+                    // flags claim a live player but none is active (corrupt snapshot): make it host-controllable.
+                    // Paused / discussion-phase rooms are left exactly as saved so no bid is lost.
+                    resetLiveState(room.auction);
                 }
-                rooms[roomId] = room;
             });
             console.log("Game state restored from Redis.");
         }
@@ -633,22 +640,46 @@ function startAuctionTimer(roomId, startTime = 15) {
     if (!room || !room.auction) return;
     
     const auction = room.auction;
-    auction.timeLeft = startTime; 
+    auction.timeLeft = Math.max(1, Number(startTime) || 15);   // never start at 0 / negative
     
     if (auction.timer) clearInterval(auction.timer);
     
     auction.timer = setInterval(() => {
-      auction.timeLeft--;
+      auction.timeLeft = Math.max(0, auction.timeLeft - 1);      // never display below 0
       io.to(roomId).emit("timer-update", auction.timeLeft);
       
       if (auction.timeLeft <= 0) {
         clearInterval(auction.timer);
         auction.timer = null;
         
+        const live = auction.activeIndex === auction.currentPlayerIndex;
+        if (!live) { recoverStuckAuction(roomId); return; }      // timer ran with no live player
         if (auction.currentBidderId) finishBidding(roomId);
         else finishPlayerUnsold(roomId);
       }
     }, 1000);
+}
+
+// Clear every "bidding is live" flag so the host can reveal the next player again.
+function resetLiveState(auction) {
+    if (auction.timer) { clearInterval(auction.timer); auction.timer = null; }
+    auction.biddingOpen = false;
+    auction.isPaused = false;
+    auction.currentBidderId = null;
+    auction.activeIndex = -1;
+    auction.timeLeft = 15;
+    auction.skippedBy = new Set();
+}
+
+// Dead-state recovery: flags say "bidding" but no player is actually live.
+function recoverStuckAuction(roomId) {
+    const room = rooms[roomId];
+    if (!room || room.auction.phase !== "AUCTION") return;
+    resetLiveState(room.auction);
+    if (room.auction.currentPlayerIndex >= room.auction.playerPool.length) return endAuctionPhase(roomId);
+    updateRoomActivity(roomId);
+    saveGameData();
+    io.to(roomId).emit("awaiting-next-player", { progress: getProgress(room.auction) });
 }
 
 // A player can be resolved (sold/unsold) exactly once, and only while he is the
@@ -769,7 +800,7 @@ io.on("connection", (socket) => {
                                   bidderName: leader ? leader.name : "Unknown"
                               });
                           }
-                          socket.emit("timer-update", room.auction.timeLeft || 15);
+                          socket.emit("timer-update", Math.max(0, room.auction.timeLeft || 0));
                       } else {
                           socket.emit("timer-paused", { timeLeft: room.auction.timeLeft });
                       }
@@ -954,6 +985,8 @@ io.on("connection", (socket) => {
     if (!room || room.hostId !== userId || room.auction.phase !== "AUCTION") return;
 
     const auction = room.auction;
+    if (auction.activeIndex !== auction.currentPlayerIndex) return;   // nothing live -> nothing to pause/resume
+    if (!auction.isPaused && !auction.biddingOpen) return;            // still in discussion phase
     if (!auction.isPaused) {
         if (auction.timer) clearInterval(auction.timer);
         auction.timer = null;
@@ -964,7 +997,7 @@ io.on("connection", (socket) => {
         auction.isPaused = false;
         auction.biddingOpen = true;
         io.to(roomId).emit("timer-resumed", { timeLeft: auction.timeLeft });
-        startAuctionTimer(roomId, auction.timeLeft);
+        startAuctionTimer(roomId, Math.max(1, auction.timeLeft));
     }
     updateRoomActivity(roomId);
   });
@@ -1019,6 +1052,9 @@ io.on("connection", (socket) => {
         room.auction.timer = null;
     }
     
+    // No live player but flags say otherwise (stuck room): repair instead of silently doing nothing
+    if (room.auction.activeIndex !== room.auction.currentPlayerIndex) return recoverStuckAuction(roomId);
+
     if (room.auction.currentBidderId) finishBidding(roomId);
     else finishPlayerUnsold(roomId);
   });
